@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+
+var Etcd = require('node-etcd'),
+    program = require('commander'),
+    fs = require('fs'),
+    pkg = require("./package.json"),
+    swig = require('swig'),
+	moment = require("moment"),
+    exec = require('child_process').exec;
+
+var conf = { SOAPservice: null, HHRPro: {} };
+
+program
+	.version( pkg.version )
+	.option('-h, --host [value]','etcd server [172.17.42.1]','172.17.42.1')
+	.parse(process.argv);
+
+console.log( "etcd server : ", program.host );
+
+etcd = new Etcd( program.host, '4001' );
+swig.setDefaults( { cache: false } );
+
+var loop = setInterval( getConf, 5000 );
+
+function getConf() {
+	etcd.get('/services', { recursive: true }, function( err, resp ) {
+		if(err) {
+			console.error("error ",err);
+		} else {
+			clearInterval(loop);
+			if( resp.node.nodes ) {
+				resp.node.nodes.forEach( function(node) {
+					if( node.key === "/services/HHR-Pro" && node.nodes ) {
+						console.log(moment().toISOString()+"\t"+node.nodes[0].key+" is up : "+node.nodes[0].value);
+						conf.HHRPro[node.nodes[0].key] = JSON.parse(node.nodes[0].value);
+					}
+					if( node.key === "/services/SOAPservice") {
+						conf.SOAPservice = JSON.parse(node.value);
+					}
+				});
+			}
+			updateNginx(conf);
+
+			watcher = etcd.watcher("/services", null, { recursive:true} );
+			watcher.on("change", function( action ) {
+			console.log(action.action)
+				switch( action.action ) {
+					case 'set':
+						if( action.node.key.match(/^\/services\/HHR-Pro/)) {
+							console.log(moment().toISOString()+"\t"+action.node.key+" change to "+action.node.value);
+							conf.HHRPro[action.node.key] = JSON.parse(action.node.value);
+						}
+						if( action.node.key === "/services/SOAPservice") {
+							console.log(moment().toISOString()+"\t"+action.node.key+" change to "+action.node.value);
+							conf.SOAPservice = JSON.parse(action.node.value);
+						}
+						break;
+					case 'delete':
+						if( action.node.key.match(/^\/services\/HHR-Pro/)) {
+							console.log(moment().toISOString()+"\t"+action.node.key+" is down ");
+							delete conf.HHRPro[action.node.key];
+						}
+						if( action.node.key === "/services/SOAPservice") {
+							console.log(moment().toISOString()+"\t"+action.node.key+" is down ");
+							conf.SOAPservice = null;
+						}
+						break;
+				}
+				updateNginx(conf);
+			});
+		}
+	});
+}
+
+function updateNginx(conf) {
+	var data = { HHR: [], SOAPservice: null };
+
+	for( prop in conf.HHRPro ) {
+		data.HHR.push(conf.HHRPro[prop]);
+		console.log( conf.HHRPro[prop].dns+"\t"+conf.HHRPro[prop].ip);
+	}
+
+	if( conf.SOAPservice ) {
+		data.SOAPservice = conf.SOAPservice;
+	}
+
+	swig.renderFile( '/etc/confd/templates/nginx.tmpl', data, function(err, output) {
+		if (err) {
+			console.log("error", err);
+			console.log("output", output);
+		} else {
+			fs.writeFileSync("/etc/nginx/conf.d/default.conf", output );
+			exec('nginx -s reload', function( error, stdout, stderr ) {
+				if (error !== null) {
+					console.log('exec error: ' + error);
+				} else {
+					console.log(moment().toISOString()+"\t"+"ngnix reloaded");
+				}
+			});
+		};
+	});
+}
